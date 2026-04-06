@@ -4,7 +4,8 @@ FROM python:3.12-slim AS builder
 WORKDIR /app
 COPY requirements.txt .
 
-RUN pip install --no-cache-dir --user -r requirements.txt
+# Install into /install so the runtime stage can copy them system-wide
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
 FROM python:3.12-slim
@@ -15,16 +16,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends tini \
 
 WORKDIR /app
 
-# Copy installed packages from builder
-COPY --from=builder /root/.local /root/.local
-ENV PATH=/root/.local/bin:$PATH
+# Copy packages into the system Python path (works for any user)
+COPY --from=builder /install /usr/local
 
 # Copy project source
 COPY bot.py .
 COPY config/ config/
 COPY src/ src/
 
-# Persistent data directory (mounted as a volume on Fly.io / Railway)
+# Persistent data directory (mounted as a volume)
 RUN mkdir -p /data
 ENV DATABASE_PATH=/data/linguabot.db
 
