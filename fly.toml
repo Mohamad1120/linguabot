@@ -1,0 +1,39 @@
+# fly.toml — LinguaBot deployment config for Fly.io
+# Deploy with: fly launch (first time) or fly deploy (updates)
+
+app = "linguabot"          # change this to a unique name, e.g. linguabot-myname
+primary_region = "ams"     # Amsterdam — change to nearest: lhr, fra, ord, sjc, sin, syd
+
+[build]
+  # Uses the existing Dockerfile in the project root
+
+[env]
+  # Non-secret env vars (secrets go in: fly secrets set KEY=value)
+  LOG_LEVEL          = "INFO"
+  TRANSLATION_PROVIDER = "google"
+  DATABASE_PATH      = "/data/linguabot.db"
+  SHOW_ORIGINAL      = "0"
+  MIN_MESSAGE_LENGTH = "2"
+  CACHE_MAX_SIZE     = "2000"
+  CACHE_TTL          = "3600"
+
+[mounts]
+  # Persistent volume for the SQLite database
+  # Create it first with: fly volumes create linguabot_data --size 1
+  source      = "linguabot_data"
+  destination = "/data"
+
+[[services]]
+  # Telegram bots use outbound connections only — no inbound port needed
+  internal_port = 8080
+  protocol      = "tcp"
+
+  [[services.tcp_checks]]
+    grace_period  = "10s"
+    interval      = "30s"
+    restart_limit = 3
+    timeout       = "5s"
+
+[metrics]
+  port = 9091
+  path = "/metrics"
