@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-LinguaBot — Real-time Telegram Translation Bot
-Entry point: starts the bot and initializes all components.
+MLangBot — Real-time Telegram Group Translation Bot
+Entry point: initializes components and starts polling.
 """
 
 import asyncio
@@ -15,11 +15,10 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     level=getattr(logging, LOG_LEVEL, logging.INFO),
 )
-logger = logging.getLogger("linguabot")
+logger = logging.getLogger("mlangbot")
 
 
 async def post_init(application: Application) -> None:
-    """Runs after the bot is initialized."""
     db = Database()
     await db.init()
     application.bot_data["db"] = db
@@ -27,13 +26,13 @@ async def post_init(application: Application) -> None:
 
 
 def main() -> None:
-    logger.info("Starting LinguaBot…")
+    logger.info("Starting MLangBot…")
 
     app = (
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
-        .concurrent_updates(True)       # handle updates concurrently
+        .concurrent_updates(True)
         .build()
     )
 

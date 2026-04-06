@@ -1,21 +1,18 @@
 """
-src/handlers.py
-All Telegram update handlers wired together.
-
-Architecture:
-  /start /help      → command_handlers.py logic (inline here for simplicity)
-  /setlang          → opens the language-selection keyboard
-  /mystats          → per-user stats in this chat
-  /groupstats       → group-wide stats
-  /enable /disable  → admin controls for the group
-  message listener  → translates every text message for subscribed users
-  callback_query    → handles keyboard interactions
+src/handlers.py  —  MLangBot
+Redesigned flow:
+  • Language setup is PRIVATE (bot DM only) — never visible in the group
+  • Messages in group are deleted then reposted as translated versions
+  • One repost per unique target language used in that chat
+  • Sender always sees their original text (included in the repost header)
+  • /setlang in a group sends the user a private DM to configure silently
 """
 
 import asyncio
 import logging
 
-from telegram import Update, Message
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -25,6 +22,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.constants import ParseMode
 
 from config.settings import MIN_MESSAGE_LENGTH, SHOW_ORIGINAL
 from .database import Database
@@ -34,6 +32,8 @@ from .translator import get_translator
 
 logger = logging.getLogger(__name__)
 
+BOT_NAME = "MLangBot"
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -42,7 +42,26 @@ def _db(context: ContextTypes.DEFAULT_TYPE) -> Database:
 
 
 async def _reply(message: Message, text: str, **kwargs) -> None:
-    await message.reply_text(text, parse_mode="HTML", **kwargs)
+    await message.reply_text(text, parse_mode=ParseMode.HTML, **kwargs)
+
+
+async def _send_private(
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    text: str,
+    **kwargs,
+) -> bool:
+    """Send a DM. Returns False if the user hasn't started the bot yet."""
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            **kwargs,
+        )
+        return True
+    except BadRequest:
+        return False
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -50,27 +69,38 @@ async def _reply(message: Message, text: str, **kwargs) -> None:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat = update.effective_chat
-    is_group = chat.type in ("group", "supergroup")
 
-    welcome = (
-        f"👋 Hello, <b>{user.first_name}</b>!\n\n"
-        "I'm <b>LinguaBot</b> — your real-time translation companion.\n\n"
-    )
-    if is_group:
-        welcome += (
-            "📌 <b>How it works in this group:</b>\n"
-            "• Use /setlang to choose <i>your</i> preferred language.\n"
-            "• Every message in the group will be automatically translated "
-            "into your chosen language and sent to you privately.\n\n"
-            "💡 Each member can pick a <i>different</i> language independently!"
+    if chat.type == "private":
+        # Check if we were deep-linked from a group (?start=setlang_CHATID)
+        if context.args and context.args[0].startswith("setlang_"):
+            chat_id = int(context.args[0].split("_")[1])
+            context.user_data["pending_setlang_chat"] = chat_id
+            db = _db(context)
+            current = await db.get_user_language(user.id, chat_id)
+            current_name = get_language_name(current) if current else "not set"
+            await _reply(
+                update.message,
+                f"🌐 <b>Set your language for the group</b>\n\n"
+                f"Current: <b>{current_name}</b>\n\n"
+                "Choose the language you want to read messages in:",
+                reply_markup=language_main_menu(page=0),
+            )
+            return
+
+        await _reply(
+            update.message,
+            f"👋 Hello, <b>{user.first_name}</b>! I'm <b>{BOT_NAME}</b>.\n\n"
+            "I translate group messages so everyone reads them in their own language.\n\n"
+            "📌 <b>How to set up:</b>\n"
+            "• Add me to a group\n"
+            "• Each member sends <b>/setlang</b> in the group\n"
+            "• I'll message you privately to pick your language\n"
+            "• Done — all messages appear translated for you!\n\n"
+            "Use /setlang here to set your default language.",
         )
     else:
-        welcome += (
-            "Add me to a group and I'll translate all messages for each member "
-            "in their own preferred language.\n\n"
-            "Use /setlang to set your language preference."
-        )
-    await _reply(update.message, welcome)
+        # In a group — nudge user to DM
+        await _setlang_group_nudge(update, context)
 
 
 # ── /help ─────────────────────────────────────────────────────────────────────
@@ -78,61 +108,74 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _reply(
         update.message,
-        "<b>🌐 LinguaBot — Commands</b>\n\n"
-        "/start — Welcome message\n"
-        "/setlang — Set your preferred language\n"
-        "/mylang — Show your current language setting\n"
-        "/mystats — Your translation stats in this chat\n"
-        "/groupstats — Group-wide translation stats\n"
-        "/enable — Enable translations in this group (admin)\n"
-        "/disable — Pause translations in this group (admin)\n"
-        "/help — Show this message\n\n"
-        "<i>Tip: Use /setlang in the group to set your language without leaving the chat.</i>",
+        f"<b>🌐 {BOT_NAME} — Commands</b>\n\n"
+        "/setlang — Set your preferred language (private)\n"
+        "/mylang — Show your current language\n"
+        "/groupstats — Active languages in this group\n"
+        "/enable — Enable translations (admin)\n"
+        "/disable — Pause translations (admin)\n"
+        "/help — Show this message",
     )
 
 
 # ── /setlang ──────────────────────────────────────────────────────────────────
 
-async def cmd_setlang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # If a code was passed inline: /setlang en
-    args = context.args
-    if args:
-        code = args[0].lower()
-        if is_valid_language(code):
-            await _apply_language(update, context, code)
-            return
-        else:
-            await _reply(
-                update.message,
-                f"❌ Unknown language code <code>{code}</code>.\n"
-                "Please choose from the menu below or use a valid BCP-47 code.",
-            )
-
-    keyboard = language_main_menu(page=0)
-    await _reply(
-        update.message,
-        "🌍 <b>Choose your preferred language:</b>\n"
-        "All messages in this chat will be translated to your selection.",
-        reply_markup=keyboard,
-    )
-
-
-async def _apply_language(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, code: str
+async def _setlang_group_nudge(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
+    """Called when /setlang is used in a group — sends a private deep-link."""
     user = update.effective_user
     chat = update.effective_chat
-    db = _db(context)
-    await db.set_user_language(user.id, chat.id, code)
-    # Ensure group is registered as active
-    if chat.type in ("group", "supergroup"):
-        await db.enable_group(chat.id)
+    bot = context.bot
 
-    name = get_language_name(code)
+    deep_link = f"https://t.me/{bot.username}?start=setlang_{chat.id}"
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔒 Set my language privately →", url=deep_link)
+    ]])
+
+    # Send ephemeral-style notice in group (auto-delete after 8 seconds)
+    try:
+        sent = await update.message.reply_text(
+            "🔒 Language settings are private. Click below to set yours:",
+            reply_markup=kb,
+        )
+        # Delete the user's /setlang command to keep chat clean
+        await asyncio.sleep(0.5)
+        try:
+            await update.message.delete()
+        except BadRequest:
+            pass
+        # Auto-delete the nudge message after 8 s
+        await asyncio.sleep(8)
+        try:
+            await sent.delete()
+        except BadRequest:
+            pass
+    except Exception as exc:
+        logger.warning("Could not send setlang nudge: %s", exc)
+
+
+async def cmd_setlang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if chat.type != "private":
+        await _setlang_group_nudge(update, context)
+        return
+
+    # In DM — show language picker
+    # If a chat context is pending, use it; otherwise use the DM itself
+    pending = context.user_data.get("pending_setlang_chat", chat.id)
+
+    db = _db(context)
+    current = await db.get_user_language(user.id, pending)
+    current_name = get_language_name(current) if current else "not set"
+
     await _reply(
-        update.message or update.callback_query.message,
-        f"✅ Language set to <b>{name}</b> ({code}).\n"
-        "All new messages in this chat will be translated for you.",
+        update.message,
+        f"🌐 <b>Choose your language</b>\n"
+        f"Current: <b>{current_name}</b>",
+        reply_markup=language_main_menu(page=0),
     )
 
 
@@ -144,32 +187,9 @@ async def cmd_mylang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     chat = update.effective_chat
     code = await db.get_user_language(user.id, chat.id)
     if code:
-        name = get_language_name(code)
-        await _reply(update.message, f"🗣 Your current language: <b>{name}</b> ({code})")
+        await _reply(update.message, f"🗣 Your language: <b>{get_language_name(code)}</b> ({code})")
     else:
-        await _reply(
-            update.message,
-            "You haven't set a language yet.\nUse /setlang to choose one.",
-        )
-
-
-# ── /mystats ──────────────────────────────────────────────────────────────────
-
-async def cmd_mystats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    db = _db(context)
-    chat = update.effective_chat
-    user = update.effective_user
-    # Reuse group stats for now (per-user stat query can be added to DB later)
-    stats = await db.get_stats(chat.id)
-    code = await db.get_user_language(user.id, chat.id) or "not set"
-    name = get_language_name(code) if code != "not set" else "not set"
-    await _reply(
-        update.message,
-        f"📊 <b>Your stats in this chat</b>\n\n"
-        f"Preferred language: <b>{name}</b>\n"
-        f"Group total translations: <b>{stats['total']:,}</b>\n"
-        f"Group total characters: <b>{stats['chars']:,}</b>",
-    )
+        await _reply(update.message, "You haven't set a language yet.\nUse /setlang to choose one.")
 
 
 # ── /groupstats ───────────────────────────────────────────────────────────────
@@ -177,18 +197,22 @@ async def cmd_mystats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def cmd_groupstats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db = _db(context)
     chat = update.effective_chat
-    stats = await db.get_stats(chat.id)
     users = await db.get_all_users_in_chat(chat.id)
-    lang_summary = ", ".join(
-        f"{get_language_name(u['language'])} ({u['language']})" for u in users[:10]
+    stats = await db.get_stats(chat.id)
+
+    if not users:
+        await _reply(update.message, "No members have set a language yet.\nEveryone should send /setlang.")
+        return
+
+    lang_lines = "\n".join(
+        f"  • {get_language_name(u['language'])} ({u['language']})" for u in users
     )
     await _reply(
         update.message,
         f"📊 <b>Group Translation Stats</b>\n\n"
-        f"Subscribed members: <b>{len(users)}</b>\n"
-        f"Total translations: <b>{stats['total']:,}</b>\n"
-        f"Total characters: <b>{stats['chars']:,}</b>\n\n"
-        f"<b>Active languages:</b>\n{lang_summary or 'none yet'}",
+        f"Members with language set: <b>{len(users)}</b>\n"
+        f"Total translations: <b>{stats['total']:,}</b>\n\n"
+        f"<b>Active languages:</b>\n{lang_lines}",
     )
 
 
@@ -205,44 +229,44 @@ async def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 async def cmd_enable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _is_admin(update, context):
-        await _reply(update.message, "⛔ Only group admins can use this command.")
+        await _reply(update.message, "⛔ Only admins can use this command.")
         return
     await _db(context).enable_group(update.effective_chat.id)
-    await _reply(update.message, "✅ LinguaBot translations are <b>enabled</b> in this group.")
+    await _reply(update.message, f"✅ {BOT_NAME} translations <b>enabled</b>.")
 
 
 async def cmd_disable(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _is_admin(update, context):
-        await _reply(update.message, "⛔ Only group admins can use this command.")
+        await _reply(update.message, "⛔ Only admins can use this command.")
         return
     await _db(context).disable_group(update.effective_chat.id)
-    await _reply(update.message, "⏸ LinguaBot translations are <b>paused</b> in this group.")
+    await _reply(update.message, f"⏸ {BOT_NAME} translations <b>paused</b>.")
 
 
-# ── Callback query handler (inline keyboards) ─────────────────────────────────
+# ── Callback query handler ────────────────────────────────────────────────────
 
 async def callback_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     data: str = query.data
+    user = update.effective_user
+    chat = update.effective_chat
 
     if data == "noop":
         return
 
     if data.startswith("lang_page:"):
         page = int(data.split(":")[1])
-        kb = language_main_menu(page=page)
-        await query.edit_message_reply_markup(reply_markup=kb)
+        await query.edit_message_reply_markup(reply_markup=language_main_menu(page=page))
         return
 
     if data.startswith("lang:"):
         code = data.split(":")[1]
         name = get_language_name(code)
-        kb = confirm_language(code, name)
         await query.edit_message_text(
-            f"🌐 Set your language to <b>{name}</b>?",
-            parse_mode="HTML",
-            reply_markup=kb,
+            f"Set your language to <b>{name}</b>?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=confirm_language(code, name),
         )
         return
 
@@ -250,120 +274,175 @@ async def callback_language(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         code = data.split(":")[1]
         name = get_language_name(code)
         db = _db(context)
-        user = update.effective_user
-        chat = update.effective_chat
-        await db.set_user_language(user.id, chat.id, code)
-        if chat.type in ("group", "supergroup"):
-            await db.enable_group(chat.id)
+
+        # Determine which chat this preference is for
+        target_chat = context.user_data.get("pending_setlang_chat", chat.id)
+
+        await db.set_user_language(user.id, target_chat, code)
+
+        # If it was a group setting, mark the group active
+        if target_chat != chat.id:
+            await db.enable_group(target_chat)
+
+        # Clear pending
+        context.user_data.pop("pending_setlang_chat", None)
+
         await query.edit_message_text(
-            f"✅ Done! Your language is now <b>{name}</b> ({code}).\n"
-            "Incoming messages in this chat will be translated for you.",
-            parse_mode="HTML",
+            f"✅ Language set to <b>{name}</b> ({code}).\n\n"
+            "All messages in the group will now appear in your chosen language.",
+            parse_mode=ParseMode.HTML,
         )
         return
 
 
-# ── Message translation handler ───────────────────────────────────────────────
+# ── Core message translation ──────────────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Main translation flow (group messages only):
+    1. Check group is enabled and has subscribers
+    2. Delete the original message
+    3. Detect source language
+    4. Fan-out: translate to each unique target language concurrently
+    5. Post one message per unique language in the group
+       (each post is labeled with sender name + original text)
+    6. Sender's original text is always preserved in the post header
+    """
     message = update.effective_message
     chat = update.effective_chat
     sender = update.effective_user
 
-    # Only in groups
-    if chat.type not in ("group", "supergroup"):
+    if not sender or chat.type not in ("group", "supergroup"):
         return
 
     text = message.text or message.caption
-    if not text or len(text) < MIN_MESSAGE_LENGTH:
+    if not text or len(text.strip()) < MIN_MESSAGE_LENGTH:
         return
 
     db = _db(context)
 
-    # Is the bot enabled for this group?
     if not await db.is_group_enabled(chat.id):
         return
 
-    # Get all subscribers in this chat
     subscribers = await db.get_all_users_in_chat(chat.id)
     if not subscribers:
         return
 
     translator = get_translator()
 
-    # Detect source language once for the whole message
+    # Detect source language once
     _, src_lang = await translator.translate(text, "en")
 
-    # Fan out translations concurrently
-    tasks = []
+    # Build map of target_lang → [user_ids]  (excluding sender if they have same lang)
+    lang_to_users: dict[str, list[int]] = {}
+    sender_lang: str | None = None
+
     for sub in subscribers:
         if sub["user_id"] == sender.id:
-            continue   # don't send back to the original author
-        if sub["language"] == src_lang:
-            continue   # already in the right language — skip
+            sender_lang = sub["language"]
+            continue
+        tgt = sub["language"]
+        if tgt == src_lang:
+            continue   # already in their language, no translation needed
+        lang_to_users.setdefault(tgt, []).append(sub["user_id"])
 
-        tasks.append(
-            _send_translation(
-                context=context,
-                db=db,
-                chat_id=chat.id,
-                recipient_id=sub["user_id"],
-                sender=sender,
-                original_text=text,
-                src_lang=src_lang,
-                tgt_lang=sub["language"],
-                translator=translator,
-            )
-        )
+    # Always include sender's original language group (they see their own text)
+    # We'll post one message for the source language too if no subscribers share it
 
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+    # Gather unique target languages
+    unique_targets = list(lang_to_users.keys())
 
+    if not unique_targets and sender_lang == src_lang:
+        # Nobody needs translation, nothing to do
+        return
 
-async def _send_translation(
-    *,
-    context: ContextTypes.DEFAULT_TYPE,
-    db: Database,
-    chat_id: int,
-    recipient_id: int,
-    sender,
-    original_text: str,
-    src_lang: str,
-    tgt_lang: str,
-    translator,
-) -> None:
+    # Delete the original message (best-effort — bot needs delete permission)
+    original_text = text
+    sender_display = sender.full_name or sender.first_name or "Someone"
+    sender_mention = f'<a href="tg://user?id={sender.id}">{sender_display}</a>'
+
     try:
-        translated, _ = await translator.translate(original_text, tgt_lang, src_lang)
+        await message.delete()
+    except BadRequest as e:
+        logger.warning("Could not delete original message: %s", e)
+        # If we can't delete, we still post translations but note the source
 
-        src_name = get_language_name(src_lang)
+    # Translate all unique targets concurrently
+    async def do_translate(tgt_lang: str) -> tuple[str, str]:
+        translated, _ = await translator.translate(original_text, tgt_lang, src_lang)
+        return tgt_lang, translated
+
+    results = await asyncio.gather(
+        *[do_translate(lang) for lang in unique_targets],
+        return_exceptions=True,
+    )
+
+    translation_map: dict[str, str] = {}
+    for r in results:
+        if isinstance(r, Exception):
+            logger.error("Translation failed: %s", r)
+            continue
+        tgt_lang, translated = r
+        translation_map[tgt_lang] = translated
+
+    # Post one message per unique target language in the group
+    for tgt_lang, translated in translation_map.items():
         tgt_name = get_language_name(tgt_lang)
-        sender_name = sender.full_name or sender.first_name
+        src_name = get_language_name(src_lang)
 
         body = (
-            f"💬 <b>{sender_name}</b> <i>({src_name} → {tgt_name})</i>\n\n"
+            f"💬 {sender_mention} <i>({src_name} → {tgt_name})</i>\n"
+            f"{'─' * 28}\n"
             f"{translated}"
         )
+
         if SHOW_ORIGINAL:
-            body += f"\n\n<i>Original:</i> {original_text}"
+            body += f"\n\n<i>📝 Original: {original_text}</i>"
 
-        await context.bot.send_message(
-            chat_id=recipient_id,
-            text=body,
-            parse_mode="HTML",
-        )
+        try:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text=body,
+                parse_mode=ParseMode.HTML,
+            )
+            await db.log_translation(
+                chat_id=chat.id,
+                user_id=sender.id,
+                src_lang=src_lang,
+                tgt_lang=tgt_lang,
+                char_count=len(original_text),
+            )
+        except Exception as exc:
+            logger.error("Failed posting translation to group: %s", exc)
 
-        await db.log_translation(
-            chat_id=chat_id,
-            user_id=recipient_id,
-            src_lang=src_lang,
-            tgt_lang=tgt_lang,
-            char_count=len(original_text),
-        )
-
-    except Exception as exc:
-        logger.warning(
-            "Failed to send translation to user %s: %s", recipient_id, exc
-        )
+    # If the sender's language differs from all target langs, also post their version
+    # (so they see their own message in the chat)
+    if sender_lang and sender_lang not in translation_map:
+        if sender_lang == src_lang:
+            # Post original for the sender
+            body = (
+                f"💬 {sender_mention}\n"
+                f"{'─' * 28}\n"
+                f"{original_text}"
+            )
+        else:
+            # Translate for sender too
+            translated_for_sender, _ = await translator.translate(
+                original_text, sender_lang, src_lang
+            )
+            body = (
+                f"💬 {sender_mention} <i>({src_name} → {get_language_name(sender_lang)})</i>\n"
+                f"{'─' * 28}\n"
+                f"{translated_for_sender}"
+            )
+        try:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text=body,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:
+            logger.error("Failed posting sender version: %s", exc)
 
 
 # ── Bot added to group ────────────────────────────────────────────────────────
@@ -374,27 +453,28 @@ async def handle_my_chat_member(
     result = update.my_chat_member
     chat = result.chat
     new_status = result.new_chat_member.status
+    bot = context.bot
 
-    if new_status in ("member", "administrator") and chat.type in (
-        "group",
-        "supergroup",
-    ):
-        db = _db(context)
-        await db.enable_group(chat.id)
+    if new_status in ("member", "administrator") and chat.type in ("group", "supergroup"):
+        await _db(context).enable_group(chat.id)
         try:
-            await context.bot.send_message(
+            deep_link = f"https://t.me/{bot.username}?start=setlang_{chat.id}"
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔒 Set my language privately →", url=deep_link)
+            ]])
+            await bot.send_message(
                 chat_id=chat.id,
                 text=(
-                    "👋 Hi everyone! I'm <b>LinguaBot</b>.\n\n"
-                    "I'll translate messages in this group so everyone can read "
-                    "them in their preferred language.\n\n"
-                    "📌 Each member should use <b>/setlang</b> to choose their language.\n"
-                    "Translations are delivered privately via direct message."
+                    f"👋 Hi! I'm <b>{BOT_NAME}</b> — your group translation assistant.\n\n"
+                    "I translate every message so each member reads the chat in their own language.\n\n"
+                    "📌 <b>Each member:</b> click below to privately set your preferred language.\n"
+                    "⚠️ <b>Admin:</b> please give me <b>Delete Messages</b> permission so I can replace messages with translations."
                 ),
-                parse_mode="HTML",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
             )
         except Exception:
-            pass   # can't message yet — that's OK
+            pass
 
 
 # ── Registration ──────────────────────────────────────────────────────────────
@@ -404,7 +484,6 @@ def register_all_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("setlang", cmd_setlang))
     app.add_handler(CommandHandler("mylang", cmd_mylang))
-    app.add_handler(CommandHandler("mystats", cmd_mystats))
     app.add_handler(CommandHandler("groupstats", cmd_groupstats))
     app.add_handler(CommandHandler("enable", cmd_enable))
     app.add_handler(CommandHandler("disable", cmd_disable))
@@ -412,10 +491,7 @@ def register_all_handlers(app: Application) -> None:
     app.add_handler(CallbackQueryHandler(callback_language))
 
     app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_message,
-        )
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
 
     app.add_handler(
